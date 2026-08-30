@@ -1,0 +1,10 @@
+venv/
+.env
+__pycache__/
+*.pyc
+.ivy2/
+data/
+*.parquet
+error.txt
+test.py
+test_stock.py
