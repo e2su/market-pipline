@@ -1,0 +1,31 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Secrets: never commit these
+.env
+.env.*
+!.env.example
+
+# Spark / data
+.ivy2/
+spark-warehouse/
+metastore_db/
+derby.log
+checkpoints/
+data/
+*.parquet
+
+# Scratch / logs
+*.log
+error.txt
+test.py
+test_stock.py
+
+# Editors
+.vscode/
+.idea/
