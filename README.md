@@ -58,7 +58,7 @@ You also need accounts on:
 
 ### Step 1 — Download the project
 ```bash
-git clone https://github.com/e2su/market-pipline.git
+git clone https://github.com/e2su/market-pipline.git market-pipeline
 cd market-pipline
 ```
 
@@ -243,6 +243,14 @@ docker-compose down
 
 ---
 
+## ☁️ Running It 24/7
+
+To keep the pipeline running when your computer is off, deploy it to one AWS EC2 server with Docker Compose.
+The always-on version stores data in Postgres instead of Redshift, because a Redshift Serverless warehouse that is
+queried every 30 seconds can cost over $1,000 a month. Step-by-step guide: **[DEPLOY.md](DEPLOY.md)**.
+
+---
+
 ## 🧪 Running the Tests
 
 ```bash
@@ -262,13 +270,17 @@ market-pipeline/
 │   └── stock_producer.py       # Polls stock prices from Alpha Vantage
 ├── processing/
 │   ├── stream_processor.py     # PySpark streaming job + anomaly detection → writes to S3
-│   └── redshift_loader.py      # Loads new S3 Parquet files into Redshift
+│   ├── redshift_loader.py      # Loads new S3 Parquet files into Redshift or Postgres
+│   └── warehouse.py            # Connects to Redshift or Postgres (WAREHOUSE setting)
 ├── dashboard/
 │   └── app.py                  # Streamlit cyberpunk dashboard
 ├── config/
 │   └── settings.py             # Shared configuration (reads .env)
 ├── tests/                      # pytest tests
-├── docker-compose.yml          # Kafka + Zookeeper setup
+├── docker-compose.yml          # Kafka + Zookeeper for local development
+├── docker-compose.prod.yml     # The whole pipeline on one server (see DEPLOY.md)
+├── Dockerfile                  # Image for the Python processes
+├── DEPLOY.md                   # Guide: run it 24/7 on AWS EC2
 ├── requirements.txt            # Python dependencies
 ├── .env.example                # Template for your .env (safe to commit)
 ├── .env                        # Your secret keys (git-ignored — never share this!)

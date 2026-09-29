@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
-import redshift_connector
 import streamlit as st
 
 # `streamlit run dashboard/app.py` only puts dashboard/ on the import path;
 # add the project root so the shared config package can be imported.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import settings  # noqa: E402
+from processing import warehouse  # noqa: E402
 
 REFRESH_SECONDS = settings.DASHBOARD_REFRESH_SECONDS
 STOCK_COLORS = ['#00ff8c', '#ff6b00', '#00d4ff', '#ff003c']
@@ -152,10 +152,11 @@ st.markdown('<div class="cyber-header">⬡ MARKET_OS // PIPELINE DASHBOARD</div>
 st.markdown('<div class="cyber-subtitle">▸ KAFKA + PYSPARK + AWS REDSHIFT ▸ REAL-TIME MARKET INTELLIGENCE ▸ SYS_ONLINE</div>', unsafe_allow_html=True)
 
 
-# ── Redshift Connection ───────────────────────────────────────────────────────
+# ── Warehouse Connection ──────────────────────────────────────────────────────
 @st.cache_resource
 def get_connection():
-    return redshift_connector.connect(**settings.redshift_connection_args())
+    # Autocommit: the dashboard only reads, so don't hold a transaction open between refreshes.
+    return warehouse.connect(autocommit=True)
 
 
 def _execute(query):
@@ -172,8 +173,8 @@ def _execute(query):
 def run_query(query):
     try:
         return _execute(query)
-    except (redshift_connector.InterfaceError, redshift_connector.OperationalError):
-        # The cached connection went stale (network blip, Redshift idle timeout):
+    except warehouse.connection_errors():
+        # The cached connection went stale (network blip, idle timeout):
         # throw it away and retry once with a fresh one.
         get_connection.clear()
         return _execute(query)
@@ -229,7 +230,7 @@ def render_dashboard():
         total_stocks = run_query("SELECT COUNT(*) AS cnt FROM stock_prices")
     except Exception as e:
         st.warning(
-            "▸ WAITING FOR DATA // Could not read from Redshift. "
+            "▸ WAITING FOR DATA // Could not read from the warehouse. "
             f"Is processing/redshift_loader.py running? ({e})"
         )
         return

@@ -60,16 +60,24 @@ def use_bundled_spark():
 
 def build_spark():
     # S3 credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
-    # environment (loaded from .env), via S3A's default credential chain.
-    return (
+    # environment (loaded from .env), or from the EC2 instance's IAM role,
+    # via S3A's default credential chain.
+    builder = (
         SparkSession.builder
         .appName("MarketDataProcessor")
         .config("spark.jars.packages", SPARK_PACKAGES)
         .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.hadoop.fs.s3a.endpoint", f"s3.{settings.AWS_REGION}.amazonaws.com")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .getOrCreate()
     )
+    if settings.S3_ENDPOINT_URL:
+        # An S3-compatible server such as MinIO (local testing).
+        builder = (
+            builder.config("spark.hadoop.fs.s3a.endpoint", settings.S3_ENDPOINT_URL)
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        )
+    else:
+        builder = builder.config("spark.hadoop.fs.s3a.endpoint", f"s3.{settings.AWS_REGION}.amazonaws.com")
+    return builder.getOrCreate()
 
 
 def flag_anomalies(df, reference_price, threshold_pct):

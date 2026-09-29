@@ -20,3 +20,17 @@ jobs:
           java-version: "17"
       - run: pip install -r requirements.txt
       - run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the app image
+        run: docker build -t market-pipeline-app .
+      - name: Check Java and the Python packages inside the image
+        run: docker run --rm market-pipeline-app sh -c "java -version && python -c 'import pyspark, psycopg, pyarrow, streamlit, kafka, redshift_connector; print(\"imports ok\")'"
+      - name: Validate docker-compose.prod.yml
+        run: |
+          cp .env.example .env
+          sed -i 's/^POSTGRES_PASSWORD=$/POSTGRES_PASSWORD=ci-only/' .env
+          docker compose -f docker-compose.prod.yml config --quiet

@@ -39,3 +39,21 @@ def test_list_parquet_keys_reads_every_page():
     keys = list_parquet_keys(FakeS3([page1, page2]), "crypto/")
     assert len(keys) == 1001
     assert keys[-1] == "crypto/part-99999.parquet"
+
+
+def test_parquet_rows_follow_table_column_order():
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from processing.redshift_loader import TABLES, parquet_rows
+
+    buffer = io.BytesIO()
+    table = pa.table({
+        "symbol": ["BTCUSDT"], "price": [64592.01], "quantity": [0.5],
+        "timestamp": [1720000000123], "anomaly": ["NORMAL"],
+    })
+    pq.write_table(table.select(["anomaly", "price", "symbol", "timestamp", "quantity"]), buffer)
+    columns = TABLES["crypto_trades"][1]
+    assert parquet_rows(buffer.getvalue(), columns) == [("BTCUSDT", 64592.01, 0.5, 1720000000123, "NORMAL")]

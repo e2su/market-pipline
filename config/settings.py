@@ -27,11 +27,25 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
+# Only for local testing against an S3-compatible server such as MinIO. Leave unset for AWS.
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL") or None
 S3_CRYPTO_PREFIX = "crypto/"
 S3_STOCK_PREFIX = "stocks/"
 
 # ── Processing ───────────────────────────────────────────────────────────────
 ANOMALY_THRESHOLD_PCT = float(os.getenv("ANOMALY_THRESHOLD_PCT", "0.5"))
+
+# ── Warehouse ────────────────────────────────────────────────────────────────
+# "redshift" (Amazon Redshift) or "postgres" (the cheap choice for running 24/7).
+WAREHOUSE = os.getenv("WAREHOUSE", "redshift").strip().lower()
+if WAREHOUSE not in ("redshift", "postgres"):
+    raise ValueError(f"WAREHOUSE must be 'redshift' or 'postgres', not {WAREHOUSE!r}")
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "market")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "market")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 
 # ── Redshift ─────────────────────────────────────────────────────────────────
 REDSHIFT_HOST = os.getenv("REDSHIFT_HOST")
@@ -55,4 +69,14 @@ def redshift_connection_args():
         password=REDSHIFT_PASSWORD,
         ssl=True,
         sslmode="require",
+    )
+
+
+def postgres_connection_args():
+    return dict(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
     )
