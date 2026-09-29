@@ -1,12 +1,21 @@
-import streamlit as st
-import redshift_connector
+import html
+import sys
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
-from dotenv import load_dotenv
-import os
-import time
+import streamlit as st
 
-load_dotenv()
+# `streamlit run dashboard/app.py` only puts dashboard/ on the import path;
+# add the project root so the shared config package can be imported.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import settings  # noqa: E402
+from processing import warehouse  # noqa: E402
+
+REFRESH_SECONDS = settings.DASHBOARD_REFRESH_SECONDS
+STOCK_COLORS = ['#00ff8c', '#ff6b00', '#00d4ff', '#ff003c']
+STOCK_VOLUME_COLORS = ['rgba(255,107,0,0.5)', 'rgba(0,255,140,0.5)',
+                       'rgba(0,212,255,0.5)', 'rgba(255,0,60,0.5)']
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -142,223 +151,263 @@ st.markdown("""
 st.markdown('<div class="cyber-header">⬡ MARKET_OS // PIPELINE DASHBOARD</div>', unsafe_allow_html=True)
 st.markdown('<div class="cyber-subtitle">▸ KAFKA + PYSPARK + AWS REDSHIFT ▸ REAL-TIME MARKET INTELLIGENCE ▸ SYS_ONLINE</div>', unsafe_allow_html=True)
 
-# ── Refresh bar ───────────────────────────────────────────────────────────────
-st.markdown(
-    f'<div class="refresh-bar">▸ LAST REFRESH: {pd.Timestamp.now().strftime("%H:%M:%S")} // AUTO-REFRESH: 30s</div>',
-    unsafe_allow_html=True
-)
 
-# ── Redshift Connection ───────────────────────────────────────────────────────
+# ── Warehouse Connection ──────────────────────────────────────────────────────
 @st.cache_resource
 def get_connection():
-    return redshift_connector.connect(
-        host=os.getenv("REDSHIFT_HOST"),
-        port=int(os.getenv("REDSHIFT_PORT")),
-        database=os.getenv("REDSHIFT_DB"),
-        user=os.getenv("REDSHIFT_USER"),
-        password=os.getenv("REDSHIFT_PASSWORD"),
-        ssl=True,
-        sslmode="require"
-    )
+    # Autocommit: the dashboard only reads, so don't hold a transaction open between refreshes.
+    return warehouse.connect(autocommit=True)
 
-@st.cache_data(ttl=25)
+
+def _execute(query):
+    cursor = get_connection().cursor()
+    try:
+        cursor.execute(query)
+        columns = [desc[0] for desc in cursor.description]
+        return pd.DataFrame(cursor.fetchall(), columns=columns)
+    finally:
+        cursor.close()
+
+
+@st.cache_data(ttl=REFRESH_SECONDS - 5)
 def run_query(query):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(query)
-    columns = [desc[0] for desc in cursor.description]
-    rows = cursor.fetchall()
-    return pd.DataFrame(rows, columns=columns)
+    try:
+        return _execute(query)
+    except warehouse.connection_errors():
+        # The cached connection went stale (network blip, idle timeout):
+        # throw it away and retry once with a fresh one.
+        get_connection.clear()
+        return _execute(query)
 
-# ── KPI Metrics ───────────────────────────────────────────────────────────────
-st.markdown('<div class="section-title">// SYSTEM METRICS</div>', unsafe_allow_html=True)
 
-col1, col2, col3, col4 = st.columns(4)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def section_title(text):
+    st.markdown(f'<div class="section-title">// {text}</div>', unsafe_allow_html=True)
 
-total_trades = run_query("SELECT COUNT(*) as cnt FROM crypto_trades")
-latest_btc   = run_query('SELECT price FROM crypto_trades WHERE symbol=\'BTCUSDT\' ORDER BY "timestamp" DESC LIMIT 1')
-anomalies    = run_query("SELECT COUNT(*) as cnt FROM crypto_trades WHERE anomaly='SPIKE'")
-total_stocks = run_query("SELECT COUNT(*) as cnt FROM stock_prices")
 
-with col1:
-    st.metric("TOTAL BTC TRADES", f"{int(total_trades['cnt'][0]):,}")
-with col2:
-    price = float(latest_btc['price'][0]) if len(latest_btc) > 0 else 0
-    st.metric("LATEST BTC PRICE", f"${price:,.2f}")
-with col3:
-    st.metric("PRICE ANOMALIES", f"{int(anomalies['cnt'][0]):,}")
-with col4:
-    st.metric("STOCK RECORDS", f"{int(total_stocks['cnt'][0]):,}")
+def cyber_table(df):
+    html_parts = ['<div style="overflow-x:auto; border:1px solid rgba(0,255,140,0.15);">',
+                  '<table style="width:100%; border-collapse:collapse; font-size:0.72rem; font-family:Share Tech Mono,monospace;">',
+                  '<thead><tr>']
+    for col in df.columns:
+        html_parts.append(f'<th style="padding:8px 12px; color:#ff6b00; letter-spacing:2px; text-transform:uppercase; border-bottom:1px solid rgba(0,255,140,0.2); text-align:left; background:#0a1628;">{html.escape(str(col))}</th>')
+    html_parts.append('</tr></thead><tbody>')
+    for i, row in enumerate(df.itertuples(index=False)):
+        bg = 'rgba(0,255,140,0.03)' if i % 2 == 0 else '#050a0e'
+        html_parts.append(f'<tr style="background:{bg};">')
+        for val in row:
+            # Escape values so data can never inject HTML into the page.
+            html_parts.append(f'<td style="padding:6px 12px; color:#00ff8c; border-bottom:1px solid rgba(0,255,140,0.07);">{html.escape(str(val))}</td>')
+        html_parts.append('</tr>')
+    html_parts.append('</tbody></table></div>')
+    return ''.join(html_parts)
 
-st.divider()
 
-# ── BTC Price Chart ───────────────────────────────────────────────────────────
-st.markdown('<div class="section-title">// BTC/USDT PRICE FEED</div>', unsafe_allow_html=True)
+def with_trade_time(df):
+    """Replace the millisecond epoch `timestamp` column with a readable UTC time."""
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    return df
 
-btc_data = run_query("""
-    SELECT "timestamp", price
-    FROM crypto_trades
-    WHERE symbol = 'BTCUSDT'
-    ORDER BY "timestamp" ASC
-    LIMIT 1000
-""")
 
-if not btc_data.empty:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=btc_data['timestamp'],
-        y=btc_data['price'],
-        mode='lines',
-        line=dict(color='#00ff8c', width=1.5),
-        fill='tozeroy',
-        fillcolor='rgba(0,255,140,0.05)',
-        name='BTC/USDT'
-    ))
-    fig.update_layout(
-        plot_bgcolor='#050a0e',
-        paper_bgcolor='#050a0e',
-        font=dict(color='#00ff8c', family='Share Tech Mono'),
-        xaxis=dict(
-            gridcolor='rgba(0,255,140,0.07)',
-            color='rgba(0,255,140,0.4)',
-            showline=True,
-            linecolor='rgba(0,255,140,0.2)',
-            title=''
-        ),
-        yaxis=dict(
-            gridcolor='rgba(0,255,140,0.07)',
-            color='rgba(0,255,140,0.4)',
-            showline=True,
-            linecolor='rgba(0,255,140,0.2)',
-            tickprefix='$',
-            title='',
-            range=[
-                btc_data['price'].min() * 0.9999,
-                btc_data['price'].max() * 1.0001
-            ]
-        ),
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=300,
-        showlegend=False,
-        hovermode='x unified'
+def pick_colors(palette, n):
+    return [palette[i % len(palette)] for i in range(n)]
+
+
+# ── Dashboard body (re-runs on its own every REFRESH_SECONDS) ─────────────────
+@st.fragment(run_every=REFRESH_SECONDS)
+def render_dashboard():
+    st.markdown(
+        f'<div class="refresh-bar">▸ LAST REFRESH: {pd.Timestamp.now().strftime("%H:%M:%S")} // AUTO-REFRESH: {REFRESH_SECONDS}s</div>',
+        unsafe_allow_html=True
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-st.divider()
+    # ── KPI Metrics ───────────────────────────────────────────────────────────
+    try:
+        total_trades = run_query("SELECT COUNT(*) AS cnt FROM crypto_trades")
+        latest_btc   = run_query('SELECT price FROM crypto_trades WHERE symbol=\'BTCUSDT\' ORDER BY "timestamp" DESC LIMIT 1')
+        anomalies    = run_query("SELECT COUNT(*) AS cnt FROM crypto_trades WHERE anomaly='SPIKE'")
+        total_stocks = run_query("SELECT COUNT(*) AS cnt FROM stock_prices")
+    except Exception as e:
+        st.warning(
+            "▸ WAITING FOR DATA // Could not read from the warehouse. "
+            f"Is processing/redshift_loader.py running? ({e})"
+        )
+        return
 
-# ── Stock Charts ──────────────────────────────────────────────────────────────
-st.markdown('<div class="section-title">// EQUITY PRICE MATRIX</div>', unsafe_allow_html=True)
-
-stock_data = run_query("""
-    SELECT symbol, price, volume
-    FROM stock_prices
-    ORDER BY "timestamp" DESC
-    LIMIT 20
-""")
-
-if not stock_data.empty:
-    unique_stocks = stock_data.drop_duplicates('symbol')
-    col1, col2 = st.columns(2)
-
+    section_title("SYSTEM METRICS")
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        fig2 = go.Figure(go.Bar(
-            x=unique_stocks['symbol'],
-            y=unique_stocks['price'],
-            marker=dict(
-                color=['#00ff8c', '#ff6b00', '#00d4ff', '#ff003c'],
-                line=dict(color='#050a0e', width=1)
-            ),
-            hovertemplate='%{x}: $%{y:,.2f}<extra></extra>'
+        st.metric("TOTAL BTC TRADES", f"{int(total_trades['cnt'][0]):,}")
+    with col2:
+        price = float(latest_btc['price'][0]) if len(latest_btc) > 0 else 0
+        st.metric("LATEST BTC PRICE", f"${price:,.2f}")
+    with col3:
+        st.metric("PRICE ANOMALIES", f"{int(anomalies['cnt'][0]):,}")
+    with col4:
+        st.metric("STOCK RECORDS", f"{int(total_stocks['cnt'][0]):,}")
+
+    st.divider()
+
+    # ── BTC Price Chart ───────────────────────────────────────────────────────
+    section_title("BTC/USDT PRICE FEED")
+
+    # Take the 1,000 *newest* trades, then sort them oldest → newest for the chart.
+    btc_data = run_query("""
+        SELECT "timestamp", price
+        FROM crypto_trades
+        WHERE symbol = 'BTCUSDT'
+        ORDER BY "timestamp" DESC
+        LIMIT 1000
+    """)
+
+    if not btc_data.empty:
+        btc_data = with_trade_time(btc_data).sort_values('timestamp')
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=btc_data['timestamp'],
+            y=btc_data['price'],
+            mode='lines',
+            line=dict(color='#00ff8c', width=1.5),
+            fill='tozeroy',
+            fillcolor='rgba(0,255,140,0.05)',
+            name='BTC/USDT'
         ))
-        fig2.update_layout(
+        fig.update_layout(
             plot_bgcolor='#050a0e',
             paper_bgcolor='#050a0e',
             font=dict(color='#00ff8c', family='Share Tech Mono'),
-            xaxis=dict(gridcolor='rgba(255,255,255,0.05)', color='rgba(0,255,140,0.5)'),
-            yaxis=dict(gridcolor='rgba(0,255,140,0.07)', color='rgba(0,255,140,0.5)', tickprefix='$'),
-            margin=dict(l=10, r=10, t=35, b=10),
-            height=280,
-            title=dict(text='PRICE // USD', font=dict(color='#ff6b00', size=10), x=0)
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-    with col2:
-        fig3 = go.Figure(go.Bar(
-            x=unique_stocks['symbol'],
-            y=unique_stocks['volume'],
-            marker=dict(
-                color=['rgba(255,107,0,0.5)', 'rgba(0,255,140,0.5)',
-                       'rgba(0,212,255,0.5)', 'rgba(255,0,60,0.5)'],
-                line=dict(color='#ff6b00', width=1)
+            xaxis=dict(
+                gridcolor='rgba(0,255,140,0.07)',
+                color='rgba(0,255,140,0.4)',
+                showline=True,
+                linecolor='rgba(0,255,140,0.2)',
+                title=''
             ),
-            hovertemplate='%{x}: %{y:,}<extra></extra>'
-        ))
-        fig3.update_layout(
-            plot_bgcolor='#050a0e',
-            paper_bgcolor='#050a0e',
-            font=dict(color='#ff6b00', family='Share Tech Mono'),
-            xaxis=dict(gridcolor='rgba(255,255,255,0.05)', color='rgba(255,107,0,0.5)'),
-            yaxis=dict(gridcolor='rgba(255,107,0,0.07)', color='rgba(255,107,0,0.5)'),
-            margin=dict(l=10, r=10, t=35, b=10),
-            height=280,
-            title=dict(text='VOLUME // SHARES', font=dict(color='#ff6b00', size=10), x=0)
+            yaxis=dict(
+                gridcolor='rgba(0,255,140,0.07)',
+                color='rgba(0,255,140,0.4)',
+                showline=True,
+                linecolor='rgba(0,255,140,0.2)',
+                tickprefix='$',
+                title='',
+                range=[
+                    btc_data['price'].min() * 0.9999,
+                    btc_data['price'].max() * 1.0001
+                ]
+            ),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=300,
+            showlegend=False,
+            hovermode='x unified'
         )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-st.divider()
+    st.divider()
 
-# ── Anomaly Log ───────────────────────────────────────────────────────────────
-st.markdown('<div class="section-title">// ANOMALY DETECTION LOG</div>', unsafe_allow_html=True)
+    # ── Stock Charts ──────────────────────────────────────────────────────────
+    section_title("EQUITY PRICE MATRIX")
 
-anomaly_data = run_query("""
-    SELECT symbol, price, quantity, anomaly
-    FROM crypto_trades
-    WHERE anomaly = 'SPIKE'
-    ORDER BY "timestamp" DESC
-    LIMIT 50
-""")
+    # Latest quote per symbol.
+    stock_data = run_query("""
+        SELECT symbol, price, volume
+        FROM (
+            SELECT symbol, price, volume,
+                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY "timestamp" DESC) AS rn
+            FROM stock_prices
+        ) AS latest
+        WHERE rn = 1
+        ORDER BY symbol
+    """)
 
-if anomaly_data.empty:
-    st.markdown(
-        '<div style="color:rgba(0,255,140,0.5); font-size:0.75rem; letter-spacing:2px; '
-        'padding:10px; border:1px solid rgba(0,255,140,0.15);">'
-        '▸ STATUS: ALL CLEAR // NO ANOMALIES DETECTED // PRICES WITHIN NORMAL RANGE'
-        '</div>',
-        unsafe_allow_html=True
-    )
-else:
-    st.markdown(cyber_table(anomaly_data), unsafe_allow_html=True)
+    if not stock_data.empty:
+        col1, col2 = st.columns(2)
 
-st.divider()
+        with col1:
+            fig2 = go.Figure(go.Bar(
+                x=stock_data['symbol'],
+                y=stock_data['price'],
+                marker=dict(
+                    color=pick_colors(STOCK_COLORS, len(stock_data)),
+                    line=dict(color='#050a0e', width=1)
+                ),
+                hovertemplate='%{x}: $%{y:,.2f}<extra></extra>'
+            ))
+            fig2.update_layout(
+                plot_bgcolor='#050a0e',
+                paper_bgcolor='#050a0e',
+                font=dict(color='#00ff8c', family='Share Tech Mono'),
+                xaxis=dict(gridcolor='rgba(255,255,255,0.05)', color='rgba(0,255,140,0.5)'),
+                yaxis=dict(gridcolor='rgba(0,255,140,0.07)', color='rgba(0,255,140,0.5)', tickprefix='$'),
+                margin=dict(l=10, r=10, t=35, b=10),
+                height=280,
+                title=dict(text='PRICE // USD', font=dict(color='#ff6b00', size=10), x=0)
+            )
+            st.plotly_chart(fig2, width="stretch")
 
-# ── Raw Data ──────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-title">// RAW DATA FEED</div>', unsafe_allow_html=True)
+        with col2:
+            fig3 = go.Figure(go.Bar(
+                x=stock_data['symbol'],
+                y=stock_data['volume'],
+                marker=dict(
+                    color=pick_colors(STOCK_VOLUME_COLORS, len(stock_data)),
+                    line=dict(color='#ff6b00', width=1)
+                ),
+                hovertemplate='%{x}: %{y:,}<extra></extra>'
+            ))
+            fig3.update_layout(
+                plot_bgcolor='#050a0e',
+                paper_bgcolor='#050a0e',
+                font=dict(color='#ff6b00', family='Share Tech Mono'),
+                xaxis=dict(gridcolor='rgba(255,255,255,0.05)', color='rgba(255,107,0,0.5)'),
+                yaxis=dict(gridcolor='rgba(255,107,0,0.07)', color='rgba(255,107,0,0.5)'),
+                margin=dict(l=10, r=10, t=35, b=10),
+                height=280,
+                title=dict(text='VOLUME // SHARES', font=dict(color='#ff6b00', size=10), x=0)
+            )
+            st.plotly_chart(fig3, width="stretch")
 
-def cyber_table(df):
-    html = '<div style="overflow-x:auto; border:1px solid rgba(0,255,140,0.15);">'
-    html += '<table style="width:100%; border-collapse:collapse; font-size:0.72rem; font-family:Share Tech Mono,monospace;">'
-    html += '<thead><tr>'
-    for col in df.columns:
-        html += f'<th style="padding:8px 12px; color:#ff6b00; letter-spacing:2px; text-transform:uppercase; border-bottom:1px solid rgba(0,255,140,0.2); text-align:left; background:#0a1628;">{col}</th>'
-    html += '</tr></thead><tbody>'
-    for i, row in df.iterrows():
-        bg = 'rgba(0,255,140,0.03)' if i % 2 == 0 else '#050a0e'
-        html += f'<tr style="background:{bg};">'
-        for val in row:
-            html += f'<td style="padding:6px 12px; color:#00ff8c; border-bottom:1px solid rgba(0,255,140,0.07);">{val}</td>'
-        html += '</tr>'
-    html += '</tbody></table></div>'
-    return html
+    st.divider()
 
-tab1, tab2 = st.tabs(["▸ CRYPTO_TRADES", "▸ STOCK_PRICES"])
+    # ── Anomaly Log ───────────────────────────────────────────────────────────
+    section_title("ANOMALY DETECTION LOG")
 
-with tab1:
-    crypto_raw = run_query('SELECT * FROM crypto_trades ORDER BY "timestamp" DESC LIMIT 100')
-    st.markdown(cyber_table(crypto_raw), unsafe_allow_html=True)
+    anomaly_data = run_query("""
+        SELECT "timestamp", symbol, price, quantity, anomaly
+        FROM crypto_trades
+        WHERE anomaly = 'SPIKE'
+        ORDER BY "timestamp" DESC
+        LIMIT 50
+    """)
 
-with tab2:
-    stock_raw = run_query('SELECT * FROM stock_prices ORDER BY "timestamp" DESC LIMIT 50')
-    st.markdown(cyber_table(stock_raw), unsafe_allow_html=True)
+    if anomaly_data.empty:
+        st.markdown(
+            '<div style="color:rgba(0,255,140,0.5); font-size:0.75rem; letter-spacing:2px; '
+            'padding:10px; border:1px solid rgba(0,255,140,0.15);">'
+            '▸ STATUS: ALL CLEAR // NO ANOMALIES DETECTED // PRICES WITHIN NORMAL RANGE'
+            '</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(cyber_table(with_trade_time(anomaly_data)), unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Raw Data ──────────────────────────────────────────────────────────────
+    section_title("RAW DATA FEED")
+
+    tab1, tab2 = st.tabs(["▸ CRYPTO_TRADES", "▸ STOCK_PRICES"])
+
+    with tab1:
+        crypto_raw = run_query('SELECT * FROM crypto_trades ORDER BY "timestamp" DESC LIMIT 100')
+        st.markdown(cyber_table(with_trade_time(crypto_raw)), unsafe_allow_html=True)
+
+    with tab2:
+        stock_raw = run_query('SELECT * FROM stock_prices ORDER BY "timestamp" DESC LIMIT 50')
+        st.markdown(cyber_table(stock_raw), unsafe_allow_html=True)
+
+
+render_dashboard()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
@@ -368,7 +417,3 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
-
-# ── Auto Refresh ──────────────────────────────────────────────────────────────
-time.sleep(5)
-st.rerun()

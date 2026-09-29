@@ -1,0 +1,18 @@
+# PySpark must stay on 3.5.x: the Kafka and hadoop-aws jars in
+# processing/stream_processor.py are built for Spark 3.5 / Scala 2.12 / Hadoop 3.3.4.
+pyspark>=3.5,<3.6
+
+kafka-python>=2.0
+websocket-client>=1.6
+requests>=2.31
+python-dotenv>=1.0
+boto3>=1.34
+redshift-connector>=2.1
+psycopg[binary]>=3.1
+pyarrow>=14
+streamlit>=1.50
+plotly>=5.20
+pandas>=2.0
+
+# Development
+pytest>=8.0

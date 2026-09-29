@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.*
+venv
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.ivy2
+spark-warehouse
+metastore_db
+checkpoints
+data

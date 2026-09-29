@@ -1,99 +1,182 @@
+import logging
 import os
+
+import pyspark
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, when
-from pyspark.sql.types import StructType, StructField, StringType, FloatType, LongType, IntegerType
-from dotenv import load_dotenv
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType
 
-# Load environment variables
-load_dotenv()
+from config import settings
 
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("stream_processor")
 
-# ── 1. Create Spark Session ──────────────────────────────────────────────────
-spark = SparkSession.builder \
-    .appName("MarketDataProcessor") \
-    .config("spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
-            "org.apache.hadoop:hadoop-aws:3.3.4,"
-            "com.amazonaws:aws-java-sdk-bundle:1.12.262") \
-    .config("spark.sql.shuffle.partitions", "2") \
-    .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY) \
-    .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_KEY) \
-    .config("spark.hadoop.fs.s3a.endpoint", "s3.eu-north-1.amazonaws.com") \
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-    .getOrCreate()
+# The jars below are built for Spark 3.5 (Scala 2.12, Hadoop 3.3.4). Mixing them with
+# another Spark version fails at runtime with errors like
+# "NoSuchMethodError: scala.Predef$.wrapRefArray", so check up front.
+SPARK_PACKAGES = ",".join([
+    f"org.apache.spark:spark-sql-kafka-0-10_2.12:{pyspark.__version__}",
+    "org.apache.hadoop:hadoop-aws:3.3.4",
+    "com.amazonaws:aws-java-sdk-bundle:1.12.262",
+])
 
-spark.sparkContext.setLogLevel("WARN")
-
-# ── 2. Define Schemas ────────────────────────────────────────────────────────
+# ── Schemas ──────────────────────────────────────────────────────────────────
+# DoubleType, not FloatType: a 32-bit float only has ~7 significant digits,
+# which turns a BTC price like 64592.01 into 64592.0078.
 crypto_schema = StructType([
     StructField("symbol", StringType()),
-    StructField("price", FloatType()),
-    StructField("quantity", FloatType()),
-    StructField("timestamp", LongType())
+    StructField("price", DoubleType()),
+    StructField("quantity", DoubleType()),
+    StructField("timestamp", LongType()),
 ])
 
 stock_schema = StructType([
     StructField("symbol", StringType()),
-    StructField("price", FloatType()),
-    StructField("volume", IntegerType()),
-    StructField("timestamp", StringType())
+    StructField("price", DoubleType()),
+    StructField("volume", LongType()),
+    StructField("timestamp", StringType()),
 ])
 
-# ── 3. Read from Kafka ───────────────────────────────────────────────────────
-crypto_raw = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "crypto-prices") \
-    .option("startingOffsets", "latest") \
-    .load()
+CRYPTO_COLUMNS = ["symbol", "price", "quantity", "timestamp", "anomaly"]
 
-stock_raw = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "stock-prices") \
-    .option("startingOffsets", "latest") \
-    .load()
 
-# ── 4. Parse JSON ────────────────────────────────────────────────────────────
-crypto_df = crypto_raw \
-    .select(from_json(col("value").cast("string"), crypto_schema).alias("data")) \
-    .select("data.*") \
-    .filter(col("price") > 0)
+def use_bundled_spark():
+    """Make PySpark use the Spark that ships with the pip package.
 
-stock_df = stock_raw \
-    .select(from_json(col("value").cast("string"), stock_schema).alias("data")) \
-    .select("data.*") \
-    .filter(col("price") > 0)
+    If SPARK_HOME points at a separately installed Spark (e.g. 4.x), PySpark
+    launches that JVM instead, and it won't match the jars above.
+    """
+    if not pyspark.__version__.startswith("3.5."):
+        raise SystemExit(
+            f"PySpark {pyspark.__version__} found, but this job needs 3.5.x. "
+            "Run: pip install -r requirements.txt"
+        )
+    bundled = os.path.dirname(pyspark.__file__)
+    spark_home = os.environ.get("SPARK_HOME")
+    if spark_home and os.path.normcase(os.path.abspath(spark_home)) != os.path.normcase(bundled):
+        log.warning("Ignoring SPARK_HOME=%s and using the Spark bundled with PySpark", spark_home)
+        os.environ["SPARK_HOME"] = bundled
 
-# ── 5. Anomaly Detection ─────────────────────────────────────────────────────
-crypto_df = crypto_df.withColumn(
-    "anomaly",
-    when(col("price") > 100000, "SPIKE").otherwise("NORMAL")
-)
 
-# ── 6. Write to S3 as Parquet ────────────────────────────────────────────────
-# Crypto data → s3a://your-bucket/crypto/
-crypto_query = crypto_df.writeStream \
-    .outputMode("append") \
-    .format("parquet") \
-    .option("path", f"s3a://{S3_BUCKET}/crypto/") \
-    .option("checkpointLocation", f"s3a://{S3_BUCKET}/checkpoints/crypto/") \
-    .trigger(processingTime="30 seconds") \
-    .start()
+def build_spark():
+    # S3 credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+    # environment (loaded from .env), or from the EC2 instance's IAM role,
+    # via S3A's default credential chain.
+    builder = (
+        SparkSession.builder
+        .appName("MarketDataProcessor")
+        .config("spark.jars.packages", SPARK_PACKAGES)
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    )
+    if settings.S3_ENDPOINT_URL:
+        # An S3-compatible server such as MinIO (local testing).
+        builder = (
+            builder.config("spark.hadoop.fs.s3a.endpoint", settings.S3_ENDPOINT_URL)
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        )
+    else:
+        builder = builder.config("spark.hadoop.fs.s3a.endpoint", f"s3.{settings.AWS_REGION}.amazonaws.com")
+    return builder.getOrCreate()
 
-# Stock data → s3a://your-bucket/stocks/
-stock_query = stock_df.writeStream \
-    .outputMode("append") \
-    .format("parquet") \
-    .option("path", f"s3a://{S3_BUCKET}/stocks/") \
-    .option("checkpointLocation", f"s3a://{S3_BUCKET}/checkpoints/stocks/") \
-    .trigger(processingTime="60 seconds") \
-    .start()
 
-print("✅ Stream processor running — writing to S3...")
+def flag_anomalies(df, reference_price, threshold_pct):
+    """Mark trades more than threshold_pct percent away from reference_price as SPIKE."""
+    deviation_pct = F.abs(F.col("price") - F.lit(reference_price)) / F.lit(reference_price) * 100
+    return (
+        df.withColumn("anomaly", F.when(deviation_pct > threshold_pct, "SPIKE").otherwise("NORMAL"))
+        .select(*CRYPTO_COLUMNS)
+    )
 
-spark.streams.awaitAnyTermination()
+
+def make_crypto_batch_writer(output_path, threshold_pct):
+    """Build the foreachBatch function that flags anomalies and writes one batch to S3.
+
+    Each trade is compared against the median price of the *previous* batch, so a
+    sudden jump stands out while the normal drift of the price does not. For the
+    very first batch we fall back to that batch's own median.
+    """
+    state = {"reference_price": None}
+
+    def write_batch(batch_df, batch_id):
+        batch_df.persist()
+        try:
+            stats = batch_df.agg(
+                F.count("*").alias("trades"),
+                F.percentile_approx("price", 0.5).alias("median_price"),
+            ).first()
+            if stats["trades"] == 0:
+                return
+
+            reference = state["reference_price"] or stats["median_price"]
+            flagged = flag_anomalies(batch_df, reference, threshold_pct)
+            # One folder per batch + overwrite = a retried batch replaces its own output
+            # instead of writing duplicates.
+            flagged.write.mode("overwrite").parquet(f"{output_path}batch_id={batch_id:012d}/")
+            state["reference_price"] = stats["median_price"]
+        finally:
+            batch_df.unpersist()
+
+    return write_batch
+
+
+def read_topic(spark, topic):
+    return (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", settings.KAFKA_BOOTSTRAP_SERVERS)
+        .option("subscribe", topic)
+        .option("startingOffsets", "latest")
+        .load()
+    )
+
+
+def parse(raw_df, schema):
+    return (
+        raw_df
+        .select(F.from_json(F.col("value").cast("string"), schema).alias("data"))
+        .select("data.*")
+        .filter(F.col("price") > 0)
+    )
+
+
+def main():
+    if not settings.S3_BUCKET:
+        raise SystemExit("S3_BUCKET_NAME is not set — add it to your .env file.")
+
+    use_bundled_spark()
+    spark = build_spark()
+    spark.sparkContext.setLogLevel("WARN")
+
+    bucket = f"s3a://{settings.S3_BUCKET}/"
+    crypto_df = parse(read_topic(spark, settings.CRYPTO_TOPIC), crypto_schema)
+    stock_df = parse(read_topic(spark, settings.STOCK_TOPIC), stock_schema)
+
+    # Crypto → s3a://<bucket>/crypto/batch_id=.../  (anomaly detection needs foreachBatch)
+    # "crypto_v2": the previous version used a plain file sink, and Spark doesn't
+    # support switching an existing checkpoint from a file sink to foreachBatch.
+    (
+        crypto_df.writeStream
+        .foreachBatch(make_crypto_batch_writer(bucket + settings.S3_CRYPTO_PREFIX, settings.ANOMALY_THRESHOLD_PCT))
+        .option("checkpointLocation", bucket + "checkpoints/crypto_v2/")
+        .trigger(processingTime="30 seconds")
+        .start()
+    )
+
+    # Stocks → s3a://<bucket>/stocks/
+    (
+        stock_df.writeStream
+        .outputMode("append")
+        .format("parquet")
+        .option("path", bucket + settings.S3_STOCK_PREFIX)
+        .option("checkpointLocation", bucket + "checkpoints/stocks/")
+        .trigger(processingTime="60 seconds")
+        .start()
+    )
+
+    log.info("✅ Stream processor running — writing to S3...")
+    spark.streams.awaitAnyTermination()
+
+
+if __name__ == "__main__":
+    main()

@@ -15,8 +15,8 @@
 This pipeline does 5 things automatically:
 
 1. **Grabs** live Bitcoin prices every second from Binance
-2. **Grabs** stock prices (AAPL, MSFT, GOOGL, AMZN) every minute from Alpha Vantage
-3. **Processes** the data using Apache Kafka and PySpark
+2. **Grabs** stock prices (AAPL, MSFT, GOOGL, AMZN) from Alpha Vantage (every 4 hours on the free tier)
+3. **Processes** the data using Apache Kafka and PySpark, flagging sudden price spikes
 4. **Saves** it to AWS (S3 data lake + Redshift warehouse)
 5. **Shows** everything on a live cyberpunk-style dashboard in your browser
 
@@ -43,10 +43,10 @@ Make sure you have all of these installed on your computer:
 
 | Tool | Why | Download Link |
 |---|---|---|
-| Python 3.11 | Runs the code | https://www.python.org/downloads/ |
+| Python 3.11 or 3.12 | Runs the code | https://www.python.org/downloads/ |
 | Docker Desktop | Runs Kafka locally | https://www.docker.com/products/docker-desktop/ |
 | VS Code | Code editor | https://code.visualstudio.com/ |
-| Java 11+ | Required by PySpark | Already installed if you followed setup |
+| Java 17 | Required by PySpark 3.5 (Java 8/11/17 are supported) | https://adoptium.net/ |
 
 You also need accounts on:
 - **Alpha Vantage** (free) → https://www.alphavantage.co/support/#api-key
@@ -58,8 +58,8 @@ You also need accounts on:
 
 ### Step 1 — Download the project
 ```bash
-git clone https://github.com/e2su/market-pipeline.git
-cd market-pipeline
+git clone https://github.com/e2su/market-pipline.git market-pipeline
+cd market-pipline
 ```
 
 ### Step 2 — Create a virtual environment
@@ -71,33 +71,31 @@ source venv/bin/activate     # Mac/Linux
 
 ### Step 3 — Install all dependencies
 ```bash
-pip install kafka-python websocket-client requests python-dotenv pyspark==3.5.0 boto3 redshift-connector streamlit plotly pandas
+pip install -r requirements.txt
 ```
+
+> ⚠️ PySpark must stay on **3.5.x**: the Kafka connector the stream processor downloads is built for Spark 3.5.
+> If you also installed Spark separately and set `SPARK_HOME`, the stream processor ignores it and uses the Spark bundled with PySpark.
 
 ### Step 4 — Set up your secret keys
 
-Create a file called `.env` in the project root and fill it in:
+Copy the template and fill in your own values:
 
+```bash
+copy .env.example .env       # Windows
+cp .env.example .env         # Mac/Linux
 ```
-ALPHA_VANTAGE_API_KEY=your_key_here
-AWS_ACCESS_KEY_ID=your_key_here
-AWS_SECRET_ACCESS_KEY=your_key_here
-AWS_REGION=eu-north-1
-S3_BUCKET_NAME=your_bucket_name_here
-REDSHIFT_HOST=your_redshift_endpoint_here
-REDSHIFT_PORT=5439
-REDSHIFT_DB=dev
-REDSHIFT_USER=admin
-REDSHIFT_PASSWORD=your_password_here
-```
+
+`.env` is listed in `.gitignore`, so git will never commit it. **Never commit real keys** — if one ever gets pushed, rotate it immediately.
 
 > 💡 **Where to get these keys:**
 > - Alpha Vantage key → sign up at https://www.alphavantage.co/support/#api-key
 > - AWS keys → AWS Console → IAM → Users → Security Credentials
 > - S3 bucket name → AWS Console → S3
 > - Redshift endpoint → AWS Console → Redshift Serverless → your workgroup
+> - `REDSHIFT_IAM_ROLE` (recommended) → create an IAM role that can read your bucket, attach it to your Redshift namespace, and paste its ARN. The loader then uses the role instead of sending your access keys to Redshift.
 
-### Step 5 — Windows only: Set up Hadoop
+### Step 5 — Windows only: Set up Hadoop (needed by PySpark)
 ```bash
 # Download winutils.exe and hadoop.dll from:
 # https://github.com/cdarlint/winutils/tree/master/hadoop-3.2.2/bin
@@ -110,9 +108,11 @@ setx HADOOP_HOME "C:\hadoop" /M    # Run as Administrator
 
 ## 🚀 How to Run the Project
 
-You need **4 terminals** open at the same time. Think of each terminal as a worker doing one job.
+You need **6 terminals** open at the same time: one for Kafka and one for each of the five Python processes. Think of each terminal as a worker doing one job.
 
 > 💡 **Tip:** In VS Code, press **Ctrl + `** to open a terminal, and **Ctrl + Shift + `** to open another one.
+
+> 💡 Run every command from the **project root folder**. The scripts are started with `python -m ...` so they can import the shared `config` package.
 
 ---
 
@@ -122,7 +122,7 @@ You need **4 terminals** open at the same time. Think of each terminal as a work
 docker-compose up -d
 ```
 
-✅ Done when you see: `Container kafka Started`
+✅ Done when you see: `Container kafka Healthy` (the `kafka-init` container then creates the two topics and exits).
 
 Check it's running:
 ```bash
@@ -136,16 +136,16 @@ You should see both `kafka` and `zookeeper` listed.
 
 ```bash
 venv\Scripts\activate
-set HADOOP_HOME=C:\hadoop
-python producers/binance_producer.py
+python -m producers.binance_producer
 ```
 
 ✅ Done when you see:
 ```
 Connected to Binance! Streaming BTC prices...
-Sent: BTCUSDT @ $64592.00
-Sent: BTCUSDT @ $64591.50
+Sent 100 trades — latest BTCUSDT @ $64592.01
 ```
+
+It reconnects on its own if the connection drops (Binance closes every connection after 24 hours).
 
 ---
 
@@ -153,15 +153,17 @@ Sent: BTCUSDT @ $64591.50
 
 ```bash
 venv\Scripts\activate
-python producers/stock_producer.py
+python -m producers.stock_producer
 ```
 
 ✅ Done when you see:
 ```
-Starting stock producer...
+Starting stock producer for AAPL, MSFT, GOOGL, AMZN (every 14400s)...
 Sent: AAPL @ $316.22
 Sent: MSFT @ $384.36
 ```
+
+> ℹ️ Alpha Vantage's free tier allows **25 requests per day**, so by default the 4 symbols are polled every 4 hours. Change `STOCK_POLL_INTERVAL_SECONDS` in `.env` if you have a paid key.
 
 ---
 
@@ -169,8 +171,7 @@ Sent: MSFT @ $384.36
 
 ```bash
 venv\Scripts\activate
-set HADOOP_HOME=C:\hadoop
-python processing/stream_processor.py
+python -m processing.stream_processor
 ```
 
 ✅ Done when you see:
@@ -186,15 +187,17 @@ python processing/stream_processor.py
 
 ```bash
 venv\Scripts\activate
-python processing/redshift_loader.py
+python -m processing.redshift_loader
 ```
 
 ✅ Done when you see:
 ```
-✅ Crypto data loaded!
-✅ Stock data loaded!
+📦 crypto_trades: 12 new file(s)
+📦 stock_prices: 1 new file(s)
 📊 Crypto trades: 38,388 | Stock records: 22
 ```
+
+Every minute it loads only the S3 files it hasn't loaded yet (it keeps track in a `loaded_files` table).
 
 ---
 
@@ -223,6 +226,12 @@ The dashboard **auto-refreshes every 30 seconds** — no need to do anything!
 
 ---
 
+## 🔍 How Anomaly Detection Works
+
+Every 30 seconds Spark processes a micro-batch of BTC trades. Each trade is compared with the **median price of the previous batch**; if it is more than `ANOMALY_THRESHOLD_PCT` percent away (default **0.5%**), it is flagged as a `SPIKE`. This catches sudden jumps while ignoring the normal drift of the price.
+
+---
+
 ## 🛑 How to Stop Everything
 
 Press **Ctrl + C** in each terminal to stop that process.
@@ -234,6 +243,24 @@ docker-compose down
 
 ---
 
+## ☁️ Running It 24/7
+
+To keep the pipeline running when your computer is off, deploy it to one AWS EC2 server with Docker Compose.
+The always-on version stores data in Postgres instead of Redshift, because a Redshift Serverless warehouse that is
+queried every 30 seconds can cost over $1,000 a month. Step-by-step guide: **[DEPLOY.md](DEPLOY.md)**.
+
+---
+
+## 🧪 Running the Tests
+
+```bash
+pytest
+```
+
+The Spark tests start a small local Spark session, so Java 17 must be installed. GitHub Actions runs the same tests on every push.
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -242,14 +269,21 @@ market-pipeline/
 │   ├── binance_producer.py     # Streams live BTC trades from Binance
 │   └── stock_producer.py       # Polls stock prices from Alpha Vantage
 ├── processing/
-│   ├── stream_processor.py     # PySpark streaming job → writes to S3
-│   └── redshift_loader.py      # Loads S3 Parquet files into Redshift
+│   ├── stream_processor.py     # PySpark streaming job + anomaly detection → writes to S3
+│   ├── redshift_loader.py      # Loads new S3 Parquet files into Redshift or Postgres
+│   └── warehouse.py            # Connects to Redshift or Postgres (WAREHOUSE setting)
 ├── dashboard/
 │   └── app.py                  # Streamlit cyberpunk dashboard
 ├── config/
-│   └── settings.py             # Shared configuration
-├── docker-compose.yml          # Kafka + Zookeeper setup
-├── .env                        # Your secret keys (never share this!)
+│   └── settings.py             # Shared configuration (reads .env)
+├── tests/                      # pytest tests
+├── docker-compose.yml          # Kafka + Zookeeper for local development
+├── docker-compose.prod.yml     # The whole pipeline on one server (see DEPLOY.md)
+├── Dockerfile                  # Image for the Python processes
+├── DEPLOY.md                   # Guide: run it 24/7 on AWS EC2
+├── requirements.txt            # Python dependencies
+├── .env.example                # Template for your .env (safe to commit)
+├── .env                        # Your secret keys (git-ignored — never share this!)
 └── README.md                   # This file
 ```
 
@@ -264,10 +298,19 @@ market-pipeline/
 → Kafka is not running. Run `docker-compose up -d` first
 
 **"No module named X"**
-→ Make sure your virtual environment is active: `venv\Scripts\activate`
+→ Make sure your virtual environment is active (`venv\Scripts\activate`) and you ran `pip install -r requirements.txt`
 
-**Dashboard shows all zeros**
-→ Wait for the Redshift loader to finish loading, then press **R** in the browser
+**"No module named config"**
+→ Run the scripts from the project root with `python -m ...`, as shown above
+
+**`NoSuchMethodError: scala.Predef$.wrapRefArray`**
+→ Spark version mismatch. Run `pip install -r requirements.txt` to get PySpark 3.5.x
+
+**Dashboard says "WAITING FOR DATA"**
+→ Start the Redshift loader and wait for its first run to finish
+
+**Stock producer says "Rate limited by Alpha Vantage"**
+→ The free daily quota (25 requests) is used up; it will try again at the next poll
 
 **PySpark won't start on Windows**
 → Make sure `HADOOP_HOME` is set: `set HADOOP_HOME=C:\hadoop`
@@ -285,7 +328,7 @@ market-pipeline/
 | Data Warehouse | Amazon Redshift Serverless |
 | Orchestration | Docker + Docker Compose |
 | Dashboard | Streamlit + Plotly |
-| Language | Python 3.11 |
+| Language | Python 3.11 / 3.12 |
 
 ---
 

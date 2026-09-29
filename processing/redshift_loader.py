@@ -1,125 +1,173 @@
-import redshift_connector
-import boto3
-import os
+"""Loads new Parquet files from S3 into the warehouse (Redshift or Postgres, see WAREHOUSE)."""
+import io
+import logging
 import time
-from dotenv import load_dotenv
 
-load_dotenv()
+import boto3
+import pyarrow.parquet as pq
 
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+from config import settings
+from processing import warehouse
 
-def get_connection():
-    return redshift_connector.connect(
-        host=os.getenv("REDSHIFT_HOST"),
-        port=int(os.getenv("REDSHIFT_PORT")),
-        database=os.getenv("REDSHIFT_DB"),
-        user=os.getenv("REDSHIFT_USER"),
-        password=os.getenv("REDSHIFT_PASSWORD"),
-        ssl=True,
-        sslmode="require"
-    )
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("redshift_loader")
 
-def get_parquet_files(s3_client, prefix):
-    """List all parquet files in S3 folder, skip metadata."""
-    response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-    files = []
-    for obj in response.get('Contents', []):
-        key = obj['Key']
-        if key.endswith('.parquet') and '_spark_metadata' not in key:
-            files.append(f's3://{S3_BUCKET}/{key}')
-    return files
-
-def refresh_redshift():
-    print("🔄 Connecting to Redshift...")
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Drop and recreate tables for fresh data
-    cursor.execute("DROP TABLE IF EXISTS crypto_trades;")
-    cursor.execute("DROP TABLE IF EXISTS stock_prices;")
-
-    cursor.execute("""
-        CREATE TABLE crypto_trades (
+# table name -> (S3 prefix, columns, CREATE statement). Column order must match the Parquet files.
+TABLES = {
+    "crypto_trades": (settings.S3_CRYPTO_PREFIX, ("symbol", "price", "quantity", "timestamp", "anomaly"), """
+        CREATE TABLE IF NOT EXISTS crypto_trades (
             symbol      VARCHAR(20),
             price       FLOAT,
             quantity    FLOAT,
             timestamp   BIGINT,
             anomaly     VARCHAR(10)
         );
-    """)
-
-    cursor.execute("""
-        CREATE TABLE stock_prices (
+    """),
+    "stock_prices": (settings.S3_STOCK_PREFIX, ("symbol", "price", "volume", "timestamp"), """
+        CREATE TABLE IF NOT EXISTS stock_prices (
             symbol      VARCHAR(10),
             price       FLOAT,
             volume      BIGINT,
             timestamp   VARCHAR(20)
         );
-    """)
+    """),
+}
 
-    conn.commit()
-    print("✅ Tables recreated!")
+# Remembers which S3 files are already in the warehouse, so each run only loads new ones.
+LOADED_FILES_DDL = """
+    CREATE TABLE loaded_files (
+        s3_key      VARCHAR(1024) PRIMARY KEY,
+        table_name  VARCHAR(64),
+        loaded_at   TIMESTAMP DEFAULT {now}
+    );
+""".format(now="GETDATE()" if settings.WAREHOUSE == "redshift" else "CURRENT_TIMESTAMP")
 
-    # Connect to S3 and list parquet files
-    s3 = boto3.client(
-        's3',
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        region_name='eu-north-1'
+
+def is_data_file(key):
+    """True for finished Parquet data files; False for Spark's metadata and in-progress output."""
+    if not key.endswith(".parquet"):
+        return False
+    return not any(part.startswith("_") for part in key.split("/"))
+
+
+def list_parquet_keys(s3, prefix):
+    """List every Parquet file under prefix.
+
+    list_objects_v2 returns at most 1,000 keys per call, so use a paginator
+    to walk through all the pages.
+    """
+    keys = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=settings.S3_BUCKET, Prefix=prefix):
+        keys.extend(obj["Key"] for obj in page.get("Contents", []) if is_data_file(obj["Key"]))
+    return keys
+
+
+def parquet_rows(data, columns):
+    """Read a Parquet file's bytes into row tuples, in the given column order."""
+    table = pq.read_table(io.BytesIO(data), columns=list(columns))
+    return [tuple(row[c] for c in columns) for row in table.to_pylist()]
+
+
+def copy_credentials():
+    if settings.REDSHIFT_IAM_ROLE:
+        return f"IAM_ROLE '{settings.REDSHIFT_IAM_ROLE}'"
+    return (
+        f"ACCESS_KEY_ID '{settings.AWS_ACCESS_KEY_ID}' "
+        f"SECRET_ACCESS_KEY '{settings.AWS_SECRET_ACCESS_KEY}'"
     )
 
-    # Load crypto data
-    crypto_files = get_parquet_files(s3, 'crypto/')
-    print(f"📦 Found {len(crypto_files)} crypto files")
-    for file_path in crypto_files:
+
+def load_file(cursor, s3, table, columns, key):
+    if settings.WAREHOUSE == "redshift":
+        # Redshift reads the file from S3 itself.
         cursor.execute(f"""
-            COPY crypto_trades
-            FROM '{file_path}'
-            ACCESS_KEY_ID '{AWS_ACCESS_KEY}'
-            SECRET_ACCESS_KEY '{AWS_SECRET_KEY}'
+            COPY {table}
+            FROM 's3://{settings.S3_BUCKET}/{key}'
+            {copy_credentials()}
             FORMAT AS PARQUET
-            REGION 'eu-north-1';
+            REGION '{settings.AWS_REGION}';
         """)
+        return
+
+    # Postgres can't read S3, so download the file and stream its rows in.
+    data = s3.get_object(Bucket=settings.S3_BUCKET, Key=key)["Body"].read()
+    with cursor.copy(f"COPY {table} ({', '.join(columns)}) FROM STDIN") as copy:
+        for row in parquet_rows(data, columns):
+            copy.write_row(row)
+
+
+def ensure_tables(conn):
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = current_schema() AND table_name = 'loaded_files'"
+    )
+    if cursor.fetchone() is None:
+        # First run after upgrading from the old drop-and-reload loader: its tables
+        # have no record of which files they contain, so start them over once.
+        log.info("Setting up incremental loading (one-time table rebuild)...")
+        for table in TABLES:
+            cursor.execute(f"DROP TABLE IF EXISTS {table};")
+        cursor.execute(LOADED_FILES_DDL)
+    for _, _, ddl in TABLES.values():
+        cursor.execute(ddl)
     conn.commit()
-    print("✅ Crypto data loaded!")
-
-    # Load stock data
-    stock_files = get_parquet_files(s3, 'stocks/')
-    print(f"📦 Found {len(stock_files)} stock files")
-    for file_path in stock_files:
-        cursor.execute(f"""
-            COPY stock_prices
-            FROM '{file_path}'
-            ACCESS_KEY_ID '{AWS_ACCESS_KEY}'
-            SECRET_ACCESS_KEY '{AWS_SECRET_KEY}'
-            FORMAT AS PARQUET
-            REGION 'eu-north-1';
-        """)
-    conn.commit()
-    print("✅ Stock data loaded!")
-
-    # Verify counts
-    cursor.execute("SELECT COUNT(*) FROM crypto_trades;")
-    crypto_count = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM stock_prices;")
-    stock_count = cursor.fetchone()[0]
-
-    print(f"📊 Crypto trades: {crypto_count:,} | Stock records: {stock_count}")
-
     cursor.close()
-    conn.close()
 
-if __name__ == "__main__":
-    print("🚀 Starting Redshift auto-loader...")
+
+def load_new_files(conn, s3, table, prefix, columns):
+    cursor = conn.cursor()
+    cursor.execute("SELECT s3_key FROM loaded_files WHERE table_name = %s", (table,))
+    already_loaded = {row[0] for row in cursor.fetchall()}
+    new_keys = [key for key in list_parquet_keys(s3, prefix) if key not in already_loaded]
+    log.info("📦 %s: %d new file(s)", table, len(new_keys))
+
+    for key in new_keys:
+        load_file(cursor, s3, table, columns, key)
+        cursor.execute("INSERT INTO loaded_files (s3_key, table_name) VALUES (%s, %s)", (key, table))
+        # Commit the data and its loaded_files row together, so a crash can't
+        # leave a file loaded-but-unrecorded (which would load it twice).
+        conn.commit()
+    cursor.close()
+    return len(new_keys)
+
+
+def refresh_warehouse(s3):
+    conn = warehouse.connect()
+    try:
+        ensure_tables(conn)
+        for table, (prefix, columns, _) in TABLES.items():
+            load_new_files(conn, s3, table, prefix, columns)
+
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM crypto_trades;")
+        crypto_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM stock_prices;")
+        stock_count = cursor.fetchone()[0]
+        log.info("📊 Crypto trades: %s | Stock records: %s", f"{crypto_count:,}", f"{stock_count:,}")
+        cursor.close()
+    finally:
+        conn.close()
+
+
+def main():
+    if not settings.S3_BUCKET:
+        raise SystemExit("S3_BUCKET_NAME is not set — add it to your .env file.")
+    if settings.WAREHOUSE == "redshift" and not settings.REDSHIFT_IAM_ROLE:
+        log.warning(
+            "REDSHIFT_IAM_ROLE is not set, so COPY sends your AWS access keys to Redshift. "
+            "Attach an IAM role to your Redshift namespace and set REDSHIFT_IAM_ROLE instead."
+        )
+
+    s3 = boto3.client("s3", region_name=settings.AWS_REGION, endpoint_url=settings.S3_ENDPOINT_URL)
+    log.info("🚀 Starting loader (warehouse: %s)...", settings.WAREHOUSE)
     while True:
         try:
-            refresh_redshift()
-            print("⏳ Waiting 60 seconds before next refresh...\n")
-            time.sleep(60)
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            print("⏳ Retrying in 30 seconds...\n")
-            time.sleep(30)
+            refresh_warehouse(s3)
+        except Exception:
+            log.exception("❌ Refresh failed, will retry")
+        time.sleep(settings.LOADER_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
