@@ -127,6 +127,10 @@ def read_topic(spark, topic):
         .option("kafka.bootstrap.servers", settings.KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", topic)
         .option("startingOffsets", "latest")
+        # The checkpoint in S3 outlives Kafka: a fresh Kafka (new machine, wiped
+        # volume) starts its offsets at 0 again. Carry on from there instead of
+        # crashing with "offset was changed from N to 0".
+        .option("failOnDataLoss", "false")
         .load()
     )
 
