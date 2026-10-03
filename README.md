@@ -2,7 +2,7 @@
 
 > **Live crypto and stock market data flowing through Kafka → PySpark → AWS S3 → Redshift → Dashboard**
 >
-> 🔴 **Live demo:** [e2su.github.io/market-pipline](https://e2su.github.io/market-pipline/), with BTC trades and spike detection running in your browser
+> 🔴 **Live demo:** [e2su.github.io/market-pipline](https://e2su.github.io/market-pipline/): a live crypto analysis terminal (indicators, order flow, whale trades, funding, sentiment and a position-size calculator) running in your browser
 
 ![Stack](https://img.shields.io/badge/Kafka-231F20?style=flat&logo=apachekafka&logoColor=white)
 ![PySpark](https://img.shields.io/badge/PySpark-E25A1C?style=flat&logo=apachespark&logoColor=white)
@@ -279,7 +279,7 @@ market-pipeline/
 ├── config/
 │   └── settings.py             # Shared configuration (reads .env)
 ├── tests/                      # pytest tests
-├── docs/index.html             # Live demo page (GitHub Pages)
+├── docs/index.html             # Live crypto analysis page (GitHub Pages)
 ├── docker-compose.yml          # Kafka + Zookeeper for local development
 ├── docker-compose.prod.yml     # The whole pipeline on one server (see DEPLOY.md)
 ├── Dockerfile                  # Image for the Python processes
