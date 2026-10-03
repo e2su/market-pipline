@@ -71,7 +71,17 @@
   }
   .tab:hover { color: var(--text); border-color: var(--green); }
   .tab[aria-pressed="true"] { color: var(--bg); background: var(--green); border-color: var(--green); }
-  .coinbar { margin-top: 14px; }
+  .coinbar { margin-top: 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .coin-pick { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase; }
+  select, input[type="search"] {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line); padding: 6px 8px; font: inherit; font-size: 0.85rem;
+  }
+  select:focus, input[type="search"]:focus { outline: 1px solid var(--green); }
+  .ov-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .ov-tools input { flex: 1 1 220px; max-width: 320px; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th.sorted::after { content: attr(data-arrow); margin-left: 4px; }
 
   .notice { display: none; margin: 14px 0 0; padding: 12px 14px; border: 1px solid var(--orange); background: var(--orange-faint); }
   .notice.show { display: block; }
@@ -181,7 +191,10 @@
       </div>
       <div id="status" class="status connecting">CONNECTING</div>
     </div>
-    <div class="tabs coinbar" id="coins" role="group" aria-label="Coin"></div>
+    <div class="coinbar">
+      <div class="tabs" id="coins" role="group" aria-label="Popular coins"></div>
+      <label class="coin-pick"><span>All coins</span><select id="coin-select" aria-label="Choose a coin"></select></label>
+    </div>
   </header>
   <div id="notice" class="notice" role="status"></div>
 
@@ -357,11 +370,20 @@
 
   <!-- Overview -->
   <div class="section-title">// Market overview</div>
-  <p class="section-sub">All tracked coins at a glance. Tap a row to analyse that coin.</p>
+  <p class="section-sub">Every tracked coin at a glance. Sort by any column to find the biggest movers, the most traded or the most stretched (RSI). Tap a row to analyse that coin.</p>
+  <div class="ov-tools">
+    <input id="ov-filter" type="search" placeholder="Search coins…" aria-label="Search coins">
+    <span class="muted" id="ov-count"></span>
+  </div>
   <div class="panel table-scroll">
     <table>
-      <thead><tr><th>Coin</th><th>Price</th><th>24h</th><th class="hide-sm">24h volume</th><th>RSI 1h</th><th>Trend 1h</th></tr></thead>
-      <tbody id="overview"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody>
+      <thead><tr id="ov-head">
+        <th class="sortable" data-k="name">Coin</th><th class="sortable" data-k="price">Price</th>
+        <th class="sortable" data-k="chg">24h</th><th class="sortable" data-k="chg7">7d</th>
+        <th class="sortable hide-sm" data-k="vol">24h volume</th><th class="sortable" data-k="rsi">RSI 1h</th>
+        <th class="sortable hide-sm" data-k="trend">Trend 1h</th>
+      </tr></thead>
+      <tbody id="overview"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -400,16 +422,42 @@
   'use strict';
 
   // ── Config ────────────────────────────────────────────────────────────────
-  const COINS = [
+  // whale = trade size (USD) listed as a whale trade (default $50K).
+  // f = futures symbol when it differs from spot (Binance lists some as 1000x contracts).
+  let COINS = [
     { s: 'BTCUSDT', t: 'BTC', n: 'Bitcoin', whale: 250000 },
     { s: 'ETHUSDT', t: 'ETH', n: 'Ethereum', whale: 150000 },
     { s: 'SOLUSDT', t: 'SOL', n: 'Solana', whale: 75000 },
     { s: 'BNBUSDT', t: 'BNB', n: 'BNB', whale: 75000 },
     { s: 'XRPUSDT', t: 'XRP', n: 'XRP', whale: 75000 },
-    { s: 'DOGEUSDT', t: 'DOGE', n: 'Dogecoin', whale: 50000 },
-    { s: 'ADAUSDT', t: 'ADA', n: 'Cardano', whale: 50000 },
-    { s: 'LINKUSDT', t: 'LINK', n: 'Chainlink', whale: 50000 },
+    { s: 'DOGEUSDT', t: 'DOGE', n: 'Dogecoin' },
+    { s: 'ADAUSDT', t: 'ADA', n: 'Cardano' },
+    { s: 'TRXUSDT', t: 'TRX', n: 'TRON' },
+    { s: 'AVAXUSDT', t: 'AVAX', n: 'Avalanche' },
+    { s: 'LINKUSDT', t: 'LINK', n: 'Chainlink' },
+    { s: 'TONUSDT', t: 'TON', n: 'Toncoin' },
+    { s: 'SUIUSDT', t: 'SUI', n: 'Sui' },
+    { s: 'XLMUSDT', t: 'XLM', n: 'Stellar' },
+    { s: 'DOTUSDT', t: 'DOT', n: 'Polkadot' },
+    { s: 'LTCUSDT', t: 'LTC', n: 'Litecoin' },
+    { s: 'BCHUSDT', t: 'BCH', n: 'Bitcoin Cash' },
+    { s: 'SHIBUSDT', t: 'SHIB', n: 'Shiba Inu', f: '1000SHIBUSDT' },
+    { s: 'HBARUSDT', t: 'HBAR', n: 'Hedera' },
+    { s: 'UNIUSDT', t: 'UNI', n: 'Uniswap' },
+    { s: 'PEPEUSDT', t: 'PEPE', n: 'Pepe', f: '1000PEPEUSDT' },
+    { s: 'NEARUSDT', t: 'NEAR', n: 'NEAR Protocol' },
+    { s: 'APTUSDT', t: 'APT', n: 'Aptos' },
+    { s: 'AAVEUSDT', t: 'AAVE', n: 'Aave' },
+    { s: 'ICPUSDT', t: 'ICP', n: 'Internet Computer' },
+    { s: 'ETCUSDT', t: 'ETC', n: 'Ethereum Classic' },
+    { s: 'ATOMUSDT', t: 'ATOM', n: 'Cosmos' },
+    { s: 'FILUSDT', t: 'FIL', n: 'Filecoin' },
+    { s: 'ARBUSDT', t: 'ARB', n: 'Arbitrum' },
+    { s: 'OPUSDT', t: 'OP', n: 'Optimism' },
+    { s: 'INJUSDT', t: 'INJ', n: 'Injective' },
   ];
+  const QUICK = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'];
+  const whaleOf = (c) => c.whale || 50000;
   const INTERVALS = ['15m', '1h', '4h', '1d'];
   const REST = ['https://data-api.binance.vision', 'https://api.binance.com'];
   const WS = ['wss://data-stream.binance.vision', 'wss://stream.binance.com:9443'];
@@ -443,7 +491,13 @@
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
-  const priceDp = (p) => (p >= 100 ? 2 : p >= 1 ? 4 : p >= 0.01 ? 5 : 7);
+  const priceDp = (p) => {
+    p = Math.abs(p);
+    if (p >= 100) return 2;
+    if (p >= 1) return 4;
+    if (!p) return 2;
+    return Math.min(10, Math.max(4, 3 - Math.floor(Math.log10(p))));   // ~4 significant digits for tiny prices
+  };
   const fmtP = (p) => (p == null || !isFinite(p)) ? '—' : '$' + Number(p).toLocaleString('en-US', { minimumFractionDigits: priceDp(p), maximumFractionDigits: priceDp(p) });
   const fmtUsd = (v) => {
     if (v == null || !isFinite(v)) return '—';
@@ -683,7 +737,7 @@
     const cutoff = Date.now() - 310000;
     while (trades.length && trades[0].t < cutoff) trades.shift();
     const usd = p * q;
-    if (usd >= coin.whale) {
+    if (usd >= whaleOf(coin)) {
       whales.unshift({ t, p, usd, buy });
       if (whales.length > 40) whales.pop();
       dirty.whales = true;
@@ -754,7 +808,7 @@
     if (g === gen) { dirty.mtf = true; dirty.signals = true; }
   }
   async function loadFutures() {
-    const g = gen, s = coin.s;
+    const g = gen, s = coin.f || coin.s;
     try {
       const [pi, oi, ls] = await Promise.all([
         getJson(`/fapi/v1/premiumIndex?symbol=${s}`, [FAPI]),
@@ -778,20 +832,39 @@
     } catch (e) { fng = null; }
     dirty.fng = true; dirty.signals = true;
   }
+  // Run fn over items with at most n requests in flight (keeps Binance's rate limits happy).
+  async function pool(items, n, fn) {
+    const queue = items.slice();
+    await Promise.all(Array.from({ length: n }, async () => { while (queue.length) await fn(queue.shift()); }));
+  }
+  // Drop any coin Binance doesn't list: one unknown symbol would make the whole overview request fail.
+  async function loadSymbols() {
+    try {
+      const live = new Set((await getJson('/api/v3/ticker/price')).map((x) => x.symbol));
+      const kept = COINS.filter((c) => live.has(c.s));
+      if (kept.length) COINS = kept;
+      if (!COINS.includes(coin)) { select(COINS[0], null); return; }
+    } catch (e) { /* keep the full list */ }
+    renderTabs();
+  }
   async function loadOverview() {
     try {
       const syms = encodeURIComponent(JSON.stringify(COINS.map((c) => c.s)));
       const ts = await getJson(`/api/v3/ticker/24hr?symbols=${syms}`);
       ts.forEach((t) => { overview[t.symbol] = Object.assign(overview[t.symbol] || {}, { price: +t.lastPrice, chg: +t.priceChangePercent, vol: +t.quoteVolume }); });
       dirty.overview = true;
-      await Promise.all(COINS.map(async (c) => {
-        try {
-          const tr = trendOf(parseKlines(await getJson(`/api/v3/klines?symbol=${c.s}&interval=1h&limit=250`)));
-          overview[c.s] = Object.assign(overview[c.s] || {}, { rsi: tr.rsi, trend: tr.label });
-        } catch (e) { /* keep the price columns */ }
-      }));
-      dirty.overview = true;
     } catch (e) { /* try again later */ }
+    await pool(COINS, 4, async (c) => {
+      try {
+        const k = parseKlines(await getJson(`/api/v3/klines?symbol=${c.s}&interval=1h&limit=250`));
+        const tr = trendOf(k);
+        const weekAgo = k.length > 168 ? k[k.length - 169].c : null;
+        overview[c.s] = Object.assign(overview[c.s] || {}, {
+          rsi: tr.rsi, trend: tr.label, chg7: weekAgo ? (last(k).c - weekAgo) / weekAgo * 100 : null,
+        });
+        dirty.overview = true;
+      } catch (e) { /* keep the price columns */ }
+    });
   }
 
   // ── Live stream ───────────────────────────────────────────────────────────
@@ -860,7 +933,9 @@
 
   // ── Rendering: tabs, numbers, tables ──────────────────────────────────────
   function renderTabs() {
-    $('coins').replaceChildren(...COINS.map((c) => {
+    const quick = COINS.filter((c) => QUICK.includes(c.s));
+    if (!quick.includes(coin)) quick.push(coin);   // keep the selected coin visible as a button
+    $('coins').replaceChildren(...quick.map((c) => {
       const b = el('button', { className: 'tab', type: 'button', textContent: c.t });
       b.setAttribute('aria-pressed', String(c === coin));
       b.onclick = () => c !== coin && select(c, null);
@@ -875,7 +950,10 @@
     $('coin-name').textContent = `${coin.n} · ${coin.t}/USDT`;
     $('read-tf').textContent = interval;
     $('lv-tf').textContent = interval;
-    $('whale-th').textContent = `(≥ ${fmtUsd(coin.whale)})`;
+    $('whale-th').textContent = `(≥ ${fmtUsd(whaleOf(coin))})`;
+    const sel = $('coin-select');
+    sel.replaceChildren(...COINS.map((c) => el('option', { value: c.s, textContent: `${c.t} · ${c.n}` })));
+    sel.value = coin.s;
     document.title = `${coin.t} · MARKET_OS Crypto Terminal`;
   }
 
@@ -993,15 +1071,18 @@
     if (!futures) return;
     if (futures.error) {
       ['fund', 'fund-next', 'oi', 'lsr'].forEach((id) => { $(id).textContent = 'Unavailable'; });
-      $('fut-note').textContent = 'Binance futures data isn\'t reachable from your region, so funding is left out of the score.';
+      $('fut-note').textContent = 'No futures data for this coin, or Binance futures isn\'t reachable from your region. Funding is left out of the score.';
       return;
     }
+    $('fut-note').textContent = 'Positive funding means longs pay shorts: the crowd is leaning long.';
     const f = $('fund');
     f.textContent = (futures.funding * 100).toFixed(4) + '%';
     f.className = 'v ' + (futures.funding * 100 > 0.03 ? 'down' : futures.funding < 0 ? 'up' : '');
     const mins = Math.max(0, Math.round((futures.next - Date.now()) / 60000));
     $('fund-next').textContent = `in ${Math.floor(mins / 60)}h ${mins % 60}m`;
-    $('oi').textContent = futures.oi != null ? `${futures.oi.toLocaleString('en-US', { maximumFractionDigits: 0 })} ${coin.t} (${fmtUsd(futures.oi * (futures.mark || currentPrice()))})` : '—';
+    // 1000x contracts (1000PEPE…) count open interest in thousands, so show only the dollar value for those.
+    const oiUsd = fmtUsd(futures.oi * (futures.mark || currentPrice()));
+    $('oi').textContent = futures.oi == null ? '—' : coin.f ? oiUsd : `${futures.oi.toLocaleString('en-US', { maximumFractionDigits: 0 })} ${coin.t} (${oiUsd})`;
     $('lsr').textContent = futures.lsr != null ? `${futures.longPct.toFixed(1)}% long (ratio ${futures.lsr.toFixed(2)})` : '—';
   }
   function renderFng() {
@@ -1035,21 +1116,63 @@
     const i = candles.length - 1, bb = ind.bb;
     $('bbw').textContent = bb.up[i] != null ? `${((bb.up[i] - bb.lo[i]) / bb.mid[i] * 100).toFixed(2)}% · price at ${(((p - bb.lo[i]) / (bb.up[i] - bb.lo[i])) * 100).toFixed(0)}% of the band` : '—';
   }
+  let ovSort = { k: 'vol', dir: -1 };
+  const TREND_RANK = { Uptrend: 1, Sideways: 0, Downtrend: -1 };
   function renderOverview() {
-    const rows = COINS.filter((c) => overview[c.s]).map((c) => {
+    const q = $('ov-filter').value.trim().toLowerCase();
+    const val = (c, k) => {
+      const o = overview[c.s] || {};
+      if (k === 'name') return c.t;
+      if (k === 'trend') return TREND_RANK[o.trend] ?? null;
+      return o[k] ?? null;
+    };
+    const list = COINS
+      .filter((c) => overview[c.s] && (!q || c.t.toLowerCase().includes(q) || c.n.toLowerCase().includes(q)))
+      .sort((a, b) => {
+        const x = val(a, ovSort.k), y = val(b, ovSort.k);
+        if (x == null) return 1;
+        if (y == null) return -1;
+        return (typeof x === 'string' ? x.localeCompare(y) : x - y) * ovSort.dir;
+      });
+    $('ov-count').textContent = `${list.length} of ${COINS.length} coins`;
+    document.querySelectorAll('#ov-head th').forEach((th) => {
+      const on = th.dataset.k === ovSort.k;
+      th.classList.toggle('sorted', on);
+      th.dataset.arrow = on ? (ovSort.dir > 0 ? '▲' : '▼') : '';
+      th.setAttribute('aria-sort', on ? (ovSort.dir > 0 ? 'ascending' : 'descending') : 'none');
+    });
+    const rows = list.map((c) => {
       const o = overview[c.s];
+      const name = el('td', null, [el('strong', { textContent: c.t, style: 'font-weight:normal;color:var(--green)' }), el('span', { className: 'muted hide-sm', textContent: ' · ' + c.n })]);
       const tr = el('tr', { className: 'clickable' + (c === coin ? ' selected' : '') }, [
-        td(`${c.t} · ${c.n}`), td(fmtP(o.price), 'num'), td(fmtPct(o.chg), 'num ' + cls(o.chg)), td(fmtUsd(o.vol), 'num hide-sm'),
+        name, td(fmtP(o.price), 'num'), td(fmtPct(o.chg), 'num ' + cls(o.chg)), td(fmtPct(o.chg7), 'num ' + cls(o.chg7)),
+        td(fmtUsd(o.vol), 'num hide-sm'),
         td(o.rsi != null ? o.rsi.toFixed(0) : '—', 'num ' + (o.rsi >= 70 ? 'down' : o.rsi <= 30 ? 'up' : '')),
-        el('td', null, [o.trend ? el('span', { className: 'pill ' + (o.trend === 'Uptrend' ? 'up' : o.trend === 'Downtrend' ? 'down' : 'warn'), textContent: o.trend }) : document.createTextNode('—')]),
+        el('td', { className: 'hide-sm' }, [o.trend ? el('span', { className: 'pill ' + (o.trend === 'Uptrend' ? 'up' : o.trend === 'Downtrend' ? 'down' : 'warn'), textContent: o.trend }) : document.createTextNode('—')]),
       ]);
       tr.tabIndex = 0;
       tr.onclick = () => { if (c !== coin) { select(c, null); window.scrollTo({ top: 0, behavior: 'smooth' }); } };
       tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); };
       return tr;
     });
-    if (rows.length) $('overview').replaceChildren(...rows);
+    $('overview').replaceChildren(...(rows.length ? rows : [el('tr', null, [el('td', { className: 'empty', colSpan: 7, textContent: q ? 'No coin matches your search.' : 'Loading…' })])]));
   }
+  document.querySelectorAll('#ov-head th').forEach((th) => {
+    th.tabIndex = 0;
+    const sortBy = () => {
+      const k = th.dataset.k;
+      // Text sorts A→Z first; numbers sort biggest first.
+      ovSort = ovSort.k === k ? { k, dir: -ovSort.dir } : { k, dir: k === 'name' ? 1 : -1 };
+      dirty.overview = true;
+    };
+    th.onclick = sortBy;
+    th.onkeydown = (e) => { if (e.key === 'Enter') sortBy(); };
+  });
+  $('ov-filter').addEventListener('input', () => { dirty.overview = true; });
+  $('coin-select').addEventListener('change', (e) => {
+    const c = COINS.find((x) => x.s === e.target.value);
+    if (c && c !== coin) select(c, null);
+  });
 
   // ── Position size calculator ──────────────────────────────────────────────
   const inputs = ['p-acct', 'p-risk', 'p-side', 'p-entry', 'p-stop'];
@@ -1315,7 +1438,8 @@
   window.addEventListener('resize', () => { dirty.chart = true; });
 
   select(coin, interval);
-  loadFng(); loadOverview();
+  loadFng();
+  loadSymbols().then(loadOverview);
   setInterval(loadBook, 5000);
   setInterval(() => { dirty.flow = true; dirty.signals = true; }, 1000);
   setInterval(loadMtf, 60000);
